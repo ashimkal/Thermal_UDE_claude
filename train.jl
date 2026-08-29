@@ -13,7 +13,7 @@
 # run; the defaults below are kept modest so CI finishes quickly.
 
 using DifferentialEquations, SciMLSensitivity
-using Optimization, OptimizationOptimisers, LineSearches, Optim
+using Optimization, OptimizationOptimisers, OptimizationOptimJL, LineSearches
 using Statistics
 using StableRNGs, Lux, Zygote, Plots, ComponentArrays, JLD2
 using Interpolations
@@ -237,25 +237,11 @@ function train_case(case::Int)
     optprob1 = OptimizationProblem(optf, p0)
     res1 = Optimization.solve(optprob1, OptimizationOptimisers.Adam(ADAM_LR); maxiters=ADAM_ITERS, callback=callback)
 
-    println("== Case $case: Stage 2 (BFGS via Optim.jl) ==")
-    f(p) = total_loss(p, train_conditions, Solver)
-    function g!(G, p)
-        G .= Zygote.gradient(f, p)[1]
-    end
+    println("== Case $case: Stage 2 (BFGS) ==")
+    optprob2 = OptimizationProblem(optf, res1.u)
+    res2 = Optimization.solve(optprob2, OptimizationOptimJL.BFGS(linesearch=LineSearches.BackTracking()); maxiters=BFGS_ITERS, callback=callback)
 
-    bfgs_iter = Ref(0)
-    function bfgs_callback(state)
-        bfgs_iter[] += 1
-        if bfgs_iter[] % 25 == 0
-            println("  iter $(bfgs_iter[])  loss = $(state.value)")
-        end
-        return false
-    end
-
-    res2 = Optim.optimize(f, g!, res1.u, Optim.BFGS(linesearch=LineSearches.BackTracking()),
-                           Optim.Options(iterations=BFGS_ITERS, callback=bfgs_callback))
-
-    p_opt = Optim.minimizer(res2)
+    p_opt = res2.u
 
     out_dir = joinpath(@__DIR__, "results", "case$case")
     mkpath(out_dir)
