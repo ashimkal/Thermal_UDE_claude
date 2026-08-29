@@ -12,13 +12,11 @@
 # (UDE_ADAM_ITERS, UDE_BFGS_ITERS, UDE_ADAM_LR) for a full reproduction
 # run; the defaults below are kept modest so CI finishes quickly.
 
-using DifferentialEquations, Lux
-using JLD2, Plots, StableRNGs, Statistics
-using ComponentArrays, Interpolations
-using MAT
-using Optimization, OptimizationOptimisers, OptimizationOptimJL
-using SciMLSensitivity
-using Zygote
+using DifferentialEquations, SciMLSensitivity
+using Optimization, OptimizationOptimisers, OptimizationOptimJL, LineSearches
+using Statistics
+using StableRNGs, Lux, Zygote, Plots, ComponentArrays, JLD2
+using Interpolations
 
 const ADAM_ITERS = parse(Int, get(ENV, "UDE_ADAM_ITERS", "200"))
 const BFGS_ITERS = parse(Int, get(ENV, "UDE_BFGS_ITERS", "50"))
@@ -241,7 +239,7 @@ function train_case(case::Int)
 
     println("== Case $case: Stage 2 (BFGS) ==")
     optprob2 = OptimizationProblem(optf, res1.u)
-    res2 = Optimization.solve(optprob2, OptimizationOptimJL.BFGS(); maxiters=BFGS_ITERS, callback=callback)
+    res2 = Optimization.solve(optprob2, OptimizationOptimJL.BFGS(linesearch=LineSearches.BackTracking()); maxiters=BFGS_ITERS, callback=callback)
 
     p_opt = res2.u
 
