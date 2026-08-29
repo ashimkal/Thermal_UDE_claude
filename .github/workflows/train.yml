@@ -1,0 +1,48 @@
+name: Train Thermal UDE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "train.jl"
+      - "Project.toml"
+      - "Case_1/**"
+      - "Case_2/**"
+      - ".github/workflows/train.yml"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    env:
+      # Reduced iteration budget so the workflow finishes quickly; override
+      # locally with larger values (see train.jl) for a full reproduction run.
+      UDE_ADAM_ITERS: "150"
+      UDE_BFGS_ITERS: "40"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.10"
+
+      - name: Cache Julia packages
+        uses: julia-actions/cache@v2
+
+      - name: Instantiate environment
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Train Case 1
+        run: julia --project=. train.jl 1
+
+      - name: Train Case 2
+        run: julia --project=. train.jl 2
+
+      - name: Upload training results
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermal-ude-training-results
+          path: results/
+          if-no-files-found: error
