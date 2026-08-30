@@ -17,9 +17,14 @@ https://doi.org/10.1016/j.egyai.2026.100808).
   parameters (warm-started), not from a fresh random initialization.
 
 Both scripts are inference/plotting scripts only — they load pre-trained
-parameters and simulate. The training loop (data assembly across conditions,
-loss, ADAM/BFGS optimization) is not itself in these files; it is documented
-below as background for anyone reproducing or extending the training code.
+parameters and simulate. The training loop lives in `train.jl` (repo root),
+documented in full under "Optimization procedure" below.
+
+- `train.jl` — trains Case 1 or Case 2 (`julia --project=. train.jl 1` or
+  `2`), writing the optimized parameters, validation metrics (RMSE/MAE/R²),
+  and a validation plot to `results/case1/` or `results/case2/`. Looks for
+  `Case_N/unique_Datasets.jld2` (key `"Datasets"`) first, falling back to
+  the shipped `Case_N/Dataset.jld2` (key `"Dataset"`) if that isn't present.
 
 ## Governing equation (UDE)
 
@@ -43,7 +48,12 @@ dT/dt = C1 * (T - T∞) + C2 * G
 - `G = U([SOC, T, I], p)^2`: heat generation, estimated by the neural network
   `U` (universal approximator) and squared so `G >= 0`, since resistive/
   irreversible heat generation cannot be negative. `I = I(t)` is the applied
-  current, obtained by linear interpolation of the measured current profile.
+  current. For a genuinely time-varying profile (WLTP) this is a linear
+  interpolation of the measured current; for a constant-current
+  discharge (0.5C/1C/2C) `I` is just the fixed discharge current as a
+  plain scalar, not an interpolant — no interpolation lookup is needed
+  or performed in that case, which is why Case 1 (constant-current only)
+  trains noticeably faster than Case 2 (which includes WLTP).
 
 The ODE system is solved with `Tsit5()` (`DifferentialEquations.jl`), and the
 NN parameters `p` are the only free/trainable parameters of the model — `C1`,
@@ -113,22 +123,51 @@ validation split described above.
 
 ## Optimization procedure
 
-Training (not included as a runnable script in this repo, but the intended
-procedure for reproducing `opt_para_case_*.jld2`) follows the standard
-`SciML`/`DiffEqFlux` two-stage UDE training pattern:
+Training is implemented in `train.jl` (repo root; `julia --project=. train.jl
+1` or `2`). It reproduces `opt_para_case_*.jld2` via a `SciML`/`DiffEqFlux`-
+style ADAM → BFGS pipeline, with the two cases following different concrete
+recipes:
 
-1. **Stage 1 — ADAM.** Optimize the NN parameters `p` with the ADAM
-   optimizer (adaptive, gradient-based, robust to a poor initial guess) to
-   quickly move into a good region of parameter space and avoid local minima
-   near initialization.
-2. **Stage 2 — BFGS.** Switch to (L-)BFGS, a quasi-Newton method, initialized
-   from the ADAM solution, to refine convergence and achieve a tighter fit
-   once near the optimum. BFGS uses second-order curvature information and
-   typically converges faster/more precisely than ADAM in this final phase.
+### Case 1
 
-Loss is computed against measured temperature (`T`) over each training
-condition's time series, combined (e.g. summed/averaged) across the mixed
-set of training conditions for that case.
+1. **Mini-batch ADAM.** 5500 iterations, cycling round-robin through the 6
+   training conditions — each iteration's objective is a single condition's
+   MSE against measured temperature, not the combined loss. Learning rate
+   `0.001`. This is a fast warm-up: no interpolation is involved (Case 1 is
+   constant-current only), so each iteration is cheap.
+2. **ADAM on the total (normalized) loss, until it plateaus.** Objective is
+   the sum, across all 6 training conditions, of each condition's MSE
+   divided by that condition's overall temperature rise (`T[end] - T[1]`).
+   "Plateaued" means the relative improvement over a trailing window of
+   iterations has fallen below a small tolerance. Learning rate `0.001`.
+3. **BFGS refinement on the total (raw) loss.** Objective is the plain sum
+   of per-condition MSE (no normalization), initialized from step 2's
+   result.
+4. **Stopping criterion:** training stops as soon as the total (raw) loss
+   drops below `0.1`, checked after both step 2 and step 3. If it's still
+   not below `0.1` after BFGS, steps 2–3 repeat (another round of
+   plateau-ADAM followed by BFGS) until it is.
+
+NN parameters initialized from `StableRNG(1111)` (cold start) before mini-
+batching begins.
+
+### Case 2
+
+Warm-started from Case 1's optimized parameters (freshly trained output if
+available, otherwise the shipped `opt_para_case_1.jld2`) — no mini-batch
+stage, no BFGS. A single ADAM stage on the total (normalized) loss (same
+metric as Case 1's step 2), learning rate `0.001`, run until the loss drops
+below `3.5`. Because Case 2's training mix includes WLTP conditions, those
+conditions' current is a genuine interpolation of the measured profile
+(constant-current conditions in the mix still use a plain scalar).
+
+All iteration counts, learning rates, plateau tolerances, and loss targets
+are overridable via environment variables read at the top of `train.jl`
+(e.g. `UDE_MINIBATCH_ITERS`, `UDE_CASE1_TARGET`, `UDE_CASE2_TARGET`) so CI
+can run a reduced smoke test without editing the script.
+
+Loss is always computed against measured temperature (`T`) over each
+training condition's time series.
 
 ## Acceptance criterion
 
