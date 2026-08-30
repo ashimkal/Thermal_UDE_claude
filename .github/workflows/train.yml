@@ -14,17 +14,12 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    env:
-      # Reduced iteration budget so the workflow finishes quickly; omit
-      # these (or set larger values, see train.jl) for a full reproduction
-      # run matching the real 5500-iter mini-batch / target-0.1 / target-3.5
-      # training recipe described in CLAUDE.md.
-      UDE_MINIBATCH_ITERS: "300"
-      UDE_CASE1_ADAM_MAX_ITERS: "500"
-      UDE_CASE1_PLATEAU_WINDOW: "50"
-      UDE_CASE1_BFGS_ITERS: "20"
-      UDE_CASE1_MAX_ROUNDS: "2"
-      UDE_CASE2_ADAM_MAX_ITERS: "500"
+    # No env overrides here: this runs train.jl's real training budget
+    # (5500-iter mini-batch, converging to the 0.1 / 3.5 loss targets
+    # described in CLAUDE.md), which can take a long time. timeout-minutes
+    # is a safety net against a run that never converges and just burns
+    # through max_iters.
+    timeout-minutes: 340
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
