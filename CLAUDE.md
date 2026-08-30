@@ -61,6 +61,10 @@ NN parameters `p` are the only free/trainable parameters of the model — `C1`,
 
 ## Neural network layer
 
+The **shipped, pre-trained** parameters (`Case_1/opt_para_case_1.jld2`,
+`Case_2/opt_para_case_2.jld2`, loaded by `Temp_pred_case1.jl` /
+`Temp_pred_case2.jl`) were trained with a single-hidden-layer network:
+
 ```julia
 U = Lux.Chain(
     Lux.Dense(3, 20, tanh),
@@ -68,9 +72,30 @@ U = Lux.Chain(
 )
 ```
 
+**`train.jl` uses a different, larger architecture** — two 20-unit hidden
+layers instead of one:
+
+```julia
+U = Lux.Chain(
+    Lux.Dense(3, 20, tanh),
+    Lux.Dense(20, 20, tanh),
+    Lux.Dense(20, 1)
+)
+```
+
+These two networks are **not parameter-compatible** — a `ComponentArray`
+trained against one has the wrong shape for the other. This matters for
+`train.jl`'s Case 2 warm-start: it can only fall back to the shipped
+`Case_1/opt_para_case_1.jld2` if no freshly-trained Case 1 output exists yet
+*and* that shipped file matches the current network shape. In practice this
+means **Case 1 must be trained with `train.jl` first** (producing
+`results/case1/opt_para_case1_trained.jld2` in the new 2-hidden-layer shape)
+before running Case 2 — the old shipped file is only usable as a Case 2
+warm-start if the network architecture is reverted to match it.
+
 - Input (3 features): `[SOC, T, I]` — state of charge, cell temperature, and
   instantaneous current.
-- Hidden layer: 20 units, `tanh` activation.
+- Hidden layer(s): 20 units each, `tanh` activation.
 - Output (1 unit): linear, no activation — squared in the ODE RHS to yield
   the non-negative heat generation term `G`.
 - Parameters initialized via `Lux.setup` with `StableRNG(1111)` for
@@ -132,20 +157,20 @@ recipes:
 
 1. **Mini-batch ADAM.** 5500 iterations, cycling round-robin through the 6
    training conditions — each iteration's objective is a single condition's
-   MSE against measured temperature, not the combined loss. Learning rate
-   `0.001`. This is a fast warm-up: no interpolation is involved (Case 1 is
-   constant-current only), so each iteration is cheap.
-2. **ADAM on the total (normalized) loss, until it plateaus.** Objective is
+   plain MSE against measured temperature (**not normalized**), not the
+   combined loss. Learning rate `0.001`. This is a fast warm-up: no
+   interpolation is involved (Case 1 is constant-current only), so each
+   iteration is cheap.
+2. **ADAM on the total normalized loss, until it plateaus.** Objective is
    the sum, across all 6 training conditions, of each condition's MSE
    divided by that condition's overall temperature rise (`T[end] - T[1]`).
    "Plateaued" means the relative improvement over a trailing window of
    iterations has fallen below a small tolerance. Learning rate `0.001`.
-3. **BFGS refinement on the total (raw) loss.** Objective is the plain sum
-   of per-condition MSE (no normalization), initialized from step 2's
-   result.
-4. **Stopping criterion:** training stops as soon as the total (raw) loss
-   drops below `0.1`, checked after both step 2 and step 3. If it's still
-   not below `0.1` after BFGS, steps 2–3 repeat (another round of
+3. **BFGS refinement, also on the total normalized loss** (same metric as
+   step 2 — not the raw/unnormalized sum), initialized from step 2's result.
+4. **Stopping criterion:** training stops as soon as the total **normalized**
+   loss drops below `0.1`, checked after both step 2 and step 3. If it's
+   still not below `0.1` after BFGS, steps 2–3 repeat (another round of
    plateau-ADAM followed by BFGS) until it is.
 
 NN parameters initialized from `StableRNG(1111)` (cold start) before mini-
@@ -154,10 +179,11 @@ batching begins.
 ### Case 2
 
 Warm-started from Case 1's optimized parameters (freshly trained output if
-available, otherwise the shipped `opt_para_case_1.jld2`) — no mini-batch
-stage, no BFGS. A single ADAM stage on the total (normalized) loss (same
-metric as Case 1's step 2), learning rate `0.001`, run until the loss drops
-below `3.5`. Because Case 2's training mix includes WLTP conditions, those
+available, otherwise the shipped `opt_para_case_1.jld2` — see the network
+architecture compatibility caveat above) — no mini-batch stage, no BFGS. A
+single ADAM stage on the total **raw** (not normalized) loss — the plain sum
+of per-condition MSE — learning rate `0.001`, run until the loss drops below
+`3.5`. Because Case 2's training mix includes WLTP conditions, those
 conditions' current is a genuine interpolation of the measured profile
 (constant-current conditions in the mix still use a plain scalar).
 

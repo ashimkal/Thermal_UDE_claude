@@ -6,18 +6,20 @@
 #   Float64, not a callable, so the ODE RHS never performs an
 #   interpolation lookup. Training is:
 #     1. Mini-batch ADAM: 5500 iterations, cycling round-robin through
-#        the 6 training conditions, one condition's MSE per iteration.
-#     2. Round loop: ADAM on the total (normalized) loss until it
-#        plateaus, then BFGS refinement on the total (raw) loss.
-#        Stops as soon as either stage's loss drops below 0.1; if BFGS
-#        still isn't below 0.1, another round of ADAM + BFGS runs.
+#        the 6 training conditions, one condition's MSE per iteration
+#        -- NOT normalized.
+#     2. Round loop: ADAM on the total NORMALIZED loss until it
+#        plateaus, then BFGS refinement, also on the total NORMALIZED
+#        loss. Stops as soon as either stage's normalized loss drops
+#        below 0.1; if BFGS still isn't below 0.1, another round of
+#        ADAM + BFGS runs.
 #
 #   Case 2 (mixed CC + WLTP, warm-started from Case 1): WLTP conditions
 #   need interpolation (current genuinely varies over time), so the
 #   ODE RHS calls an interpolant for those; CC conditions still use a
-#   plain constant. Training is a single ADAM stage on the total
-#   (normalized) loss, starting from Case 1's optimized parameters,
-#   until the loss drops below 3.5.
+#   plain constant. Training is a single ADAM stage on the total RAW
+#   (not normalized) loss, starting from Case 1's optimized
+#   parameters, until the loss drops below 3.5.
 #
 # Usage:
 #   julia --project=. train.jl 1     # train Case 1 (cold start)
@@ -86,7 +88,7 @@ function load_dataset(case)
 end
 
 function build_network()
-    U = Lux.Chain(Lux.Dense(3, 20, tanh), Lux.Dense(20, 1))
+    U = Lux.Chain(Lux.Dense(3, 20, tanh), Lux.Dense(20, 20, tanh), Lux.Dense(20, 1))
     _, st = Lux.setup(StableRNG(1111), U)
     return U, st
 end
@@ -185,7 +187,8 @@ function single_condition_mse(c::Condition, p)
 end
 
 # Normalized total loss (each condition's MSE divided by its overall
-# temperature rise) -- the ADAM training objective in both cases.
+# temperature rise) -- Case 1's ADAM and BFGS objective, and the metric
+# Case 1's 0.1 stopping criterion is checked against.
 function totalloss_normalized(conditions, p)
     total = 0.0
     for c in conditions
@@ -199,8 +202,7 @@ function totalloss_normalized(conditions, p)
 end
 
 # Raw total loss (plain sum of per-condition MSE, no normalization) --
-# the BFGS objective, and the metric Case 1's stopping criterion is
-# checked against after each stage.
+# Case 2's ADAM objective and 3.5 stopping criterion.
 function totalloss_raw(conditions, p)
     total = 0.0
     for c in conditions
@@ -290,25 +292,25 @@ end
 # ---------------------------------------------------------------------
 
 function train_case1(conditions, p0)
-    println("Stage 1: mini-batch ADAM ($(MINIBATCH_ITERS) iters, round-robin single-condition MSE)")
+    println("Stage 1: mini-batch ADAM ($(MINIBATCH_ITERS) iters, round-robin single-condition MSE, not normalized)")
     p = minibatch_adam(conditions, p0; lr=CASE1_ADAM_LR, maxiters=MINIBATCH_ITERS)
 
-    loss_val = totalloss_raw(conditions, p)
+    loss_val = totalloss_normalized(conditions, p)
     for round in 1:CASE1_MAX_ROUNDS
         println("Round $round: ADAM on total (normalized) loss until plateau (target=$(CASE1_TARGET))")
         p, _ = run_adam(pp -> totalloss_normalized(conditions, pp), p;
                          lr=CASE1_ADAM_LR, target=CASE1_TARGET, max_iters=CASE1_ADAM_MAX_ITERS,
                          window=CASE1_PLATEAU_WINDOW, rel_tol=CASE1_PLATEAU_RELTOL, label="ADAM")
-        loss_val = totalloss_raw(conditions, p)
-        println("  -> after ADAM: raw total loss=$(loss_val)")
+        loss_val = totalloss_normalized(conditions, p)
+        println("  -> after ADAM: normalized total loss=$(loss_val)")
         if loss_val < CASE1_TARGET
             break
         end
 
-        println("Round $round: BFGS refine on total (raw) loss")
-        p, bfgs_loss = bfgs_refine(pp -> totalloss_raw(conditions, pp), p; maxiters=CASE1_BFGS_ITERS)
+        println("Round $round: BFGS refine on total (normalized) loss")
+        p, bfgs_loss = bfgs_refine(pp -> totalloss_normalized(conditions, pp), p; maxiters=CASE1_BFGS_ITERS)
         loss_val = bfgs_loss
-        println("  -> after BFGS: raw total loss=$(loss_val)")
+        println("  -> after BFGS: normalized total loss=$(loss_val)")
         if loss_val < CASE1_TARGET
             break
         end
@@ -317,8 +319,8 @@ function train_case1(conditions, p0)
 end
 
 function train_case2(conditions, p0_warm)
-    println("Case 2: ADAM on total (normalized) loss (warm-started from Case 1) until target=$(CASE2_TARGET)")
-    p, loss_val = run_adam(pp -> totalloss_normalized(conditions, pp), p0_warm;
+    println("Case 2: ADAM on total (raw, not normalized) loss (warm-started from Case 1) until target=$(CASE2_TARGET)")
+    p, loss_val = run_adam(pp -> totalloss_raw(conditions, pp), p0_warm;
                             lr=CASE2_ADAM_LR, target=CASE2_TARGET, max_iters=CASE2_ADAM_MAX_ITERS,
                             window=nothing, label="ADAM")
     return p, loss_val
