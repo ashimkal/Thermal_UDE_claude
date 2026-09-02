@@ -22,12 +22,21 @@
 #   parameters, until the loss drops below 3.5.
 #
 # Usage:
-#   julia --project=. train.jl 1     # train Case 1 (cold start)
-#   julia --project=. train.jl 2     # train Case 2 (warm-started from Case 1)
+#   julia --project=. train.jl 1     # train Case 1 (cold start, or resume)
+#   julia --project=. train.jl 2     # train Case 2 (warm-started from Case 1, or resume)
 #
 # All iteration counts / targets can be overridden via environment
 # variables (see the `const ... = parse(...)` block below) so CI can
 # run a reduced smoke test while local/full runs use the real budget.
+#
+# A run may not have enough wall-clock time (e.g. one GitHub Actions job)
+# to reach the loss targets above. Set UDE_MAX_WALLTIME_SECONDS to bound
+# how long this run trains before it checkpoints its progress to
+# checkpoints/ and exits cleanly (still not converged). Re-running
+# `julia train.jl <case>` picks the checkpoint back up rather than
+# starting over -- repeat as many times as needed until it converges.
+# checkpoints/ is committed to the repo (unlike results/, which is
+# git-ignored) specifically so it survives across separate runs/jobs.
 
 using DifferentialEquations, SciMLSensitivity
 using Optimization, OptimizationOptimisers, OptimizationOptimJL, LineSearches
@@ -43,11 +52,58 @@ const CASE1_PLATEAU_WINDOW = parse(Int, get(ENV, "UDE_CASE1_PLATEAU_WINDOW", "20
 const CASE1_PLATEAU_RELTOL = parse(Float64, get(ENV, "UDE_CASE1_PLATEAU_RELTOL", "1e-4"))
 const CASE1_ADAM_MAX_ITERS = parse(Int, get(ENV, "UDE_CASE1_ADAM_MAX_ITERS", "20000"))
 const CASE1_BFGS_ITERS = parse(Int, get(ENV, "UDE_CASE1_BFGS_ITERS", "50"))
-const CASE1_MAX_ROUNDS = parse(Int, get(ENV, "UDE_CASE1_MAX_ROUNDS", "5"))
+# Rounds are cheap to loop through (each round's own iteration counts are
+# what actually bound the work); the real stop condition is CASE1_TARGET
+# or the wall-clock budget below, so this is set high rather than tight.
+const CASE1_MAX_ROUNDS = parse(Int, get(ENV, "UDE_CASE1_MAX_ROUNDS", "1000"))
 
 const CASE2_ADAM_LR = parse(Float64, get(ENV, "UDE_CASE2_ADAM_LR", "0.001"))
 const CASE2_TARGET = parse(Float64, get(ENV, "UDE_CASE2_TARGET", "3.5"))
-const CASE2_ADAM_MAX_ITERS = parse(Int, get(ENV, "UDE_CASE2_ADAM_MAX_ITERS", "50000"))
+const CASE2_ADAM_MAX_ITERS = parse(Int, get(ENV, "UDE_CASE2_ADAM_MAX_ITERS", "100000000"))
+
+# ---------------------------------------------------------------------
+# Wall-clock budget + checkpointing
+#
+# A single run (e.g. one GitHub Actions job) may not have enough wall-clock
+# time to reach the loss targets above. UDE_MAX_WALLTIME_SECONDS bounds how
+# long this run trains before saving a checkpoint and exiting cleanly
+# (default: effectively unlimited, for local/manual runs). Re-running
+# `julia train.jl <case>` afterwards resumes from checkpoints/ instead of
+# starting over. checkpoints/ is committed to the repo (unlike results/,
+# which is git-ignored) specifically so it survives across separate CI runs.
+# ---------------------------------------------------------------------
+
+const MAX_WALLTIME_SECONDS = parse(Float64, get(ENV, "UDE_MAX_WALLTIME_SECONDS", "1e9"))
+const START_TIME = time()
+const TIMED_OUT = Ref(false)
+
+function time_budget_exceeded()
+    if !TIMED_OUT[] && (time() - START_TIME) > MAX_WALLTIME_SECONDS
+        TIMED_OUT[] = true
+    end
+    return TIMED_OUT[]
+end
+
+const CHECKPOINT_DIR = joinpath(@__DIR__, "checkpoints")
+checkpoint_path(case) = joinpath(CHECKPOINT_DIR, "case$(case)_checkpoint.jld2")
+status_path(case) = joinpath(CHECKPOINT_DIR, "case$(case)_status.txt")
+
+function save_checkpoint(case, p, stage_idx, done)
+    mkpath(CHECKPOINT_DIR)
+    save(checkpoint_path(case), Dict("p" => p, "stage_idx" => stage_idx, "done" => done))
+    write(status_path(case), done ? "done" : "in_progress")
+end
+
+# Returns (p, stage_idx, done); p is `nothing` and stage_idx is 1 if no
+# checkpoint exists yet.
+function load_checkpoint(case)
+    path = checkpoint_path(case)
+    if !isfile(path)
+        return nothing, 1, false
+    end
+    d = load(path)
+    return d["p"], d["stage_idx"], d["done"]
+end
 
 # function to find the end of the discharge in the constant current discharge tests.
 function find_discharge_end(Current_data, start=5)
@@ -230,6 +286,9 @@ function minibatch_adam(conditions, p0; lr, maxiters, log_every=100)
     end
     iter = Ref(0)
     function cb(state, l)
+        if time_budget_exceeded()
+            return true
+        end
         iter[] += 1
         if iter[] % log_every == 0
             println("    mini-batch iter $(iter[])  loss=$(l)")
@@ -249,6 +308,9 @@ end
 function run_adam(loss_fn, p0; lr, target, max_iters, window=nothing, rel_tol=1e-4, log_every=100, label="ADAM")
     hist = Float64[]
     function cb(state, l)
+        if time_budget_exceeded()
+            return true
+        end
         push!(hist, l)
         if length(hist) % log_every == 0
             println("    $label iter $(length(hist))  loss=$(l)")
@@ -275,6 +337,9 @@ end
 function bfgs_refine(loss_fn, p0; maxiters, log_every=10)
     iter = Ref(0)
     function cb(state, l)
+        if time_budget_exceeded()
+            return true
+        end
         iter[] += 1
         if iter[] % log_every == 0
             println("    BFGS iter $(iter[])  loss=$(l)")
@@ -291,53 +356,105 @@ end
 # Case-level training
 # ---------------------------------------------------------------------
 
-function train_case1(conditions, p0)
-    println("Stage 1: mini-batch ADAM ($(MINIBATCH_ITERS) iters, round-robin single-condition MSE, not normalized)")
-    p = minibatch_adam(conditions, p0; lr=CASE1_ADAM_LR, maxiters=MINIBATCH_ITERS)
-
-    loss_val = totalloss_normalized(conditions, p)
-    for round in 1:CASE1_MAX_ROUNDS
-        println("Round $round: ADAM on total (normalized) loss until plateau (target=$(CASE1_TARGET))")
-        p, _ = run_adam(pp -> totalloss_normalized(conditions, pp), p;
-                         lr=CASE1_ADAM_LR, target=CASE1_TARGET, max_iters=CASE1_ADAM_MAX_ITERS,
-                         window=CASE1_PLATEAU_WINDOW, rel_tol=CASE1_PLATEAU_RELTOL, label="ADAM")
-        loss_val = totalloss_normalized(conditions, p)
-        println("  -> after ADAM: normalized total loss=$(loss_val)")
-        if loss_val < CASE1_TARGET
-            break
-        end
-
-        println("Round $round: BFGS refine on total (normalized) loss")
-        p, bfgs_loss = bfgs_refine(pp -> totalloss_normalized(conditions, pp), p; maxiters=CASE1_BFGS_ITERS)
-        loss_val = bfgs_loss
-        println("  -> after BFGS: normalized total loss=$(loss_val)")
-        if loss_val < CASE1_TARGET
-            break
-        end
+# Flat list of stages Case 1 works through: mini-batch once, then
+# (ADAM, BFGS) pairs, one pair per round. A "stage index" into this list
+# is what gets checkpointed, so a resumed run can jump straight back in.
+function case1_stage_list()
+    stages = Symbol[:minibatch]
+    for _ in 1:CASE1_MAX_ROUNDS
+        push!(stages, :adam)
+        push!(stages, :bfgs)
     end
-    return p, loss_val
+    return stages
 end
 
+# Runs Case 1's stage list starting at `start_stage_idx` (1 = from
+# scratch). Returns (p, loss, converged). If the wall-clock budget runs
+# out mid-stage, checkpoints p and returns converged=false with a
+# checkpoint pointing back at the SAME stage (that stage type is simply
+# re-entered from p on the next run -- ADAM/BFGS are both fine to resume
+# from an arbitrary point). Checkpoints after every stage, not just at
+# the end, so at most one stage's work is ever at risk from an unclean
+# interruption (e.g. the runner being killed outright).
+function train_case1(conditions, p0; start_stage_idx=1)
+    stages = case1_stage_list()
+    p = p0
+    idx = clamp(start_stage_idx, 1, length(stages))
+    loss_val = totalloss_normalized(conditions, p)
+
+    while idx <= length(stages)
+        stage = stages[idx]
+        if stage == :minibatch
+            println("Stage $(idx)/$(length(stages)): mini-batch ADAM ($(MINIBATCH_ITERS) iters cap, not normalized)")
+            p = minibatch_adam(conditions, p; lr=CASE1_ADAM_LR, maxiters=MINIBATCH_ITERS)
+        elseif stage == :adam
+            println("Stage $(idx)/$(length(stages)): ADAM on total normalized loss until plateau (target=$(CASE1_TARGET))")
+            p, _ = run_adam(pp -> totalloss_normalized(conditions, pp), p;
+                             lr=CASE1_ADAM_LR, target=CASE1_TARGET, max_iters=CASE1_ADAM_MAX_ITERS,
+                             window=CASE1_PLATEAU_WINDOW, rel_tol=CASE1_PLATEAU_RELTOL, label="ADAM")
+        else # :bfgs
+            println("Stage $(idx)/$(length(stages)): BFGS refine on total normalized loss")
+            p, _ = bfgs_refine(pp -> totalloss_normalized(conditions, pp), p; maxiters=CASE1_BFGS_ITERS)
+        end
+
+        loss_val = totalloss_normalized(conditions, p)
+        println("  -> after stage $(idx) ($(stage)): normalized total loss=$(loss_val)")
+        converged = loss_val < CASE1_TARGET
+        exhausted_time = time_budget_exceeded()
+
+        next_idx = (exhausted_time && !converged) ? idx : idx + 1
+        save_checkpoint(1, p, next_idx, converged)
+
+        if converged
+            return p, loss_val, true
+        end
+        if exhausted_time
+            println("Wall-clock budget exhausted mid-stage $(idx); checkpoint saved to resume from the same stage.")
+            return p, loss_val, false
+        end
+        idx = next_idx
+    end
+
+    println("Exhausted $(length(stages)) stages ($(CASE1_MAX_ROUNDS) rounds) without reaching target $(CASE1_TARGET).")
+    return p, loss_val, false
+end
+
+# Single ADAM stage on the raw total loss. Resuming after a timeout or an
+# unconverged max_iters cap just means calling this again starting from
+# the checkpointed p -- there's no multi-stage state to track.
 function train_case2(conditions, p0_warm)
     println("Case 2: ADAM on total (raw, not normalized) loss (warm-started from Case 1) until target=$(CASE2_TARGET)")
     p, loss_val = run_adam(pp -> totalloss_raw(conditions, pp), p0_warm;
                             lr=CASE2_ADAM_LR, target=CASE2_TARGET, max_iters=CASE2_ADAM_MAX_ITERS,
                             window=nothing, label="ADAM")
-    return p, loss_val
+    converged = loss_val < CASE2_TARGET
+    save_checkpoint(2, p, 1, converged)
+    if !converged
+        reason = time_budget_exceeded() ? "wall-clock budget exhausted" : "max_iters reached"
+        println("Case 2 not yet converged ($(reason)); checkpoint saved to resume.")
+    end
+    return p, loss_val, converged
 end
 
+# Case 2 can only warm-start from a Case 1 that has actually finished
+# (loss_val < CASE1_TARGET) -- there's no usable shipped fallback since
+# the network architecture (2 hidden layers) doesn't match the shipped
+# opt_para_case_1.jld2 (trained on the old 1-hidden-layer network).
 function load_case1_params()
-    fresh_path = joinpath(@__DIR__, "results", "case1", "opt_para_case1_trained.jld2")
-    shipped_path = joinpath(@__DIR__, "Case_1", "opt_para_case_1.jld2")
-    if isfile(fresh_path)
-        println("Warm-starting Case 2 from freshly trained Case 1 parameters.")
-        return load(fresh_path)["opt_para_case1_trained"]
-    elseif isfile(shipped_path)
-        println("Warm-starting Case 2 from shipped Case 1 optimized parameters.")
-        return load(shipped_path)["opt_para_case_1"]
-    else
-        error("No Case 1 optimized parameters found to warm-start Case 2.")
+    case1_p, _, case1_done = load_checkpoint(1)
+    if case1_done && case1_p !== nothing
+        println("Warm-starting Case 2 from Case 1's completed checkpoint.")
+        return case1_p
     end
+
+    fresh_path = joinpath(@__DIR__, "results", "case1", "opt_para_case1_trained.jld2")
+    if isfile(fresh_path)
+        println("Warm-starting Case 2 from Case 1's saved results file.")
+        return load(fresh_path)["opt_para_case1_trained"]
+    end
+
+    error("Case 1 has not finished training yet (no completed checkpoint or results file). " *
+          "Run/resume `julia train.jl 1` until it converges before training Case 2.")
 end
 
 # ---------------------------------------------------------------------
@@ -393,14 +510,32 @@ function train_case(case::Int)
     train_conditions = build_conditions(CASE_TRAIN_CONDITIONS[case], data_file, U, st)
     val_conditions = build_conditions(CASE_VAL_CONDITIONS[case], data_file, U, st)
 
-    if case == 1
-        p0 = ComponentArray(Lux.setup(StableRNG(1111), U)[1])
-        p_opt, final_loss = train_case1(train_conditions, p0)
+    checkpoint_p, stage_idx, already_done = load_checkpoint(case)
+
+    if already_done
+        println("Case $case checkpoint is already marked done; re-evaluating/re-plotting from it.")
+        p_opt = checkpoint_p
+        converged = true
+    elseif case == 1
+        p0 = checkpoint_p !== nothing ? checkpoint_p : ComponentArray(Lux.setup(StableRNG(1111), U)[1])
+        if checkpoint_p !== nothing
+            println("Resuming Case 1 from checkpoint at stage $(stage_idx).")
+        end
+        p_opt, final_loss, converged = train_case1(train_conditions, p0; start_stage_idx=stage_idx)
+        println("Case 1 loss after this run: $(final_loss)  (converged=$(converged))")
     else
-        p0_warm = load_case1_params()
-        p_opt, final_loss = train_case2(train_conditions, p0_warm)
+        p0_warm = checkpoint_p !== nothing ? checkpoint_p : load_case1_params()
+        if checkpoint_p !== nothing
+            println("Resuming Case 2 from checkpoint.")
+        end
+        p_opt, final_loss, converged = train_case2(train_conditions, p0_warm)
+        println("Case 2 loss after this run: $(final_loss)  (converged=$(converged))")
     end
-    println("Final training loss for Case $case: $(final_loss)")
+
+    if !converged
+        println("Case $case has not converged yet -- exiting so a follow-up run can resume from the checkpoint.")
+        return nothing
+    end
 
     out_dir = joinpath(@__DIR__, "results", "case$case")
     mkpath(out_dir)

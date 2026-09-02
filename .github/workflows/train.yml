@@ -11,15 +11,25 @@ on:
       - "Case_2/**"
       - ".github/workflows/train.yml"
 
+# contents:write so this job can commit checkpoints/ back to the branch;
+# actions:write so it can re-dispatch itself when training isn't done yet.
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   train:
     runs-on: ubuntu-latest
-    # No env overrides here: this runs train.jl's real training budget
-    # (5500-iter mini-batch, converging to the 0.1 / 3.5 loss targets
-    # described in CLAUDE.md), which can take a long time. timeout-minutes
-    # is a safety net against a run that never converges and just burns
-    # through max_iters.
+    # This runs train.jl's real training budget (5500-iter mini-batch,
+    # converging to the 0.1 / 3.5 loss targets described in CLAUDE.md),
+    # which can easily exceed a single job's runtime. UDE_MAX_WALLTIME_SECONDS
+    # (5h) leaves headroom under timeout-minutes for checkout/instantiate/
+    # evaluate/plot/commit steps; train.jl checkpoints to checkpoints/ and
+    # exits cleanly if it runs out of time, and the last step below
+    # re-triggers this workflow so training picks back up where it left off.
     timeout-minutes: 340
+    env:
+      UDE_MAX_WALLTIME_SECONDS: "18000"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,15 +45,55 @@ jobs:
       - name: Instantiate environment
         run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
-      - name: Train Case 1
+      - name: Train Case 1 (resumes from checkpoints/ if present)
         run: julia --project=. train.jl 1
 
-      - name: Train Case 2
+      - name: Check Case 1 status
+        id: case1
+        run: |
+          status=$(cat checkpoints/case1_status.txt 2>/dev/null || echo "in_progress")
+          echo "Case 1 status: $status"
+          echo "done=$([ "$status" = "done" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # Case 2 warm-starts from Case 1's finished parameters, so it can
+      # only run once Case 1 has actually converged.
+      - name: Train Case 2 (resumes from checkpoints/ if present)
+        if: steps.case1.outputs.done == 'true'
         run: julia --project=. train.jl 2
+
+      - name: Check Case 2 status
+        id: case2
+        run: |
+          status=$(cat checkpoints/case2_status.txt 2>/dev/null || echo "in_progress")
+          echo "Case 2 status: $status"
+          echo "done=$([ "$status" = "done" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Commit checkpoint progress
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add checkpoints/
+          if ! git diff --cached --quiet; then
+            git commit -m "Update training checkpoints [skip ci]"
+            git push
+          else
+            echo "No checkpoint changes to commit."
+          fi
 
       - name: Upload training results
         uses: actions/upload-artifact@v4
         with:
           name: thermal-ude-training-results
           path: results/
-          if-no-files-found: error
+          if-no-files-found: warn
+
+      # Neither case is fully converged yet: queue another run of this same
+      # workflow so it resumes from the checkpoints just committed above.
+      # workflow_dispatch invoked explicitly like this (as opposed to an
+      # automatic push/PR event) is not blocked by GITHUB_TOKEN's usual
+      # "don't trigger other workflows" restriction.
+      - name: Re-trigger workflow to continue training
+        if: steps.case1.outputs.done != 'true' || steps.case2.outputs.done != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run train.yml --ref "${{ github.ref_name }}"

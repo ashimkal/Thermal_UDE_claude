@@ -25,6 +25,9 @@ documented in full under "Optimization procedure" below.
   and a validation plot to `results/case1/` or `results/case2/`. Looks for
   `Case_N/unique_Datasets.jld2` (key `"Datasets"`) first, falling back to
   the shipped `Case_N/Dataset.jld2` (key `"Dataset"`) if that isn't present.
+  Checkpoints to `checkpoints/` and can be safely re-run to resume training
+  that didn't finish in one sitting — see "Wall-clock budget, checkpointing,
+  and resuming across runs" below.
 
 ## Governing equation (UDE)
 
@@ -84,14 +87,12 @@ U = Lux.Chain(
 ```
 
 These two networks are **not parameter-compatible** — a `ComponentArray`
-trained against one has the wrong shape for the other. This matters for
-`train.jl`'s Case 2 warm-start: it can only fall back to the shipped
-`Case_1/opt_para_case_1.jld2` if no freshly-trained Case 1 output exists yet
-*and* that shipped file matches the current network shape. In practice this
-means **Case 1 must be trained with `train.jl` first** (producing
-`results/case1/opt_para_case1_trained.jld2` in the new 2-hidden-layer shape)
-before running Case 2 — the old shipped file is only usable as a Case 2
-warm-start if the network architecture is reverted to match it.
+trained against one has the wrong shape for the other. Because of this,
+`train.jl`'s Case 2 warm-start has **no fallback to the shipped
+`opt_para_case_1.jld2`** (that would silently hit a shape mismatch); it only
+accepts a completed Case 1 checkpoint or `results/case1/opt_para_case1_trained.jld2`.
+**Case 1 must be trained (and fully converged) with `train.jl` first** —
+`julia train.jl 2` errors out immediately, with a clear message, if it isn't.
 
 - Input (3 features): `[SOC, T, I]` — state of charge, cell temperature, and
   instantaneous current.
@@ -178,14 +179,14 @@ batching begins.
 
 ### Case 2
 
-Warm-started from Case 1's optimized parameters (freshly trained output if
-available, otherwise the shipped `opt_para_case_1.jld2` — see the network
-architecture compatibility caveat above) — no mini-batch stage, no BFGS. A
-single ADAM stage on the total **raw** (not normalized) loss — the plain sum
-of per-condition MSE — learning rate `0.001`, run until the loss drops below
-`3.5`. Because Case 2's training mix includes WLTP conditions, those
-conditions' current is a genuine interpolation of the measured profile
-(constant-current conditions in the mix still use a plain scalar).
+Warm-started from Case 1's optimized parameters (see the network architecture
+compatibility caveat above — Case 1 must have actually finished) — no
+mini-batch stage, no BFGS. A single ADAM stage on the total **raw** (not
+normalized) loss — the plain sum of per-condition MSE — learning rate
+`0.001`, run until the loss drops below `3.5`. Because Case 2's training mix
+includes WLTP conditions, those conditions' current is a genuine
+interpolation of the measured profile (constant-current conditions in the
+mix still use a plain scalar).
 
 All iteration counts, learning rates, plateau tolerances, and loss targets
 are overridable via environment variables read at the top of `train.jl`
@@ -194,6 +195,35 @@ can run a reduced smoke test without editing the script.
 
 Loss is always computed against measured temperature (`T`) over each
 training condition's time series.
+
+### Wall-clock budget, checkpointing, and resuming across runs
+
+Reaching these loss targets can take longer than a single run has time for
+(e.g. one GitHub Actions job). `train.jl` supports checkpointing so training
+can be resumed across as many separate runs as it takes:
+
+- `UDE_MAX_WALLTIME_SECONDS` bounds how long a single `julia train.jl <case>`
+  invocation trains before it stops itself, saves a checkpoint, and exits
+  cleanly (default: effectively unlimited, for local/manual runs).
+- Checkpoints live in `checkpoints/case1_checkpoint.jld2` /
+  `checkpoints/case2_checkpoint.jld2` (parameters + which stage to resume
+  at), plus a plain-text `checkpoints/case{1,2}_status.txt` (`"done"` or
+  `"in_progress"`) for easy shell-script inspection. Unlike `results/`,
+  `checkpoints/` is **not** git-ignored — it's meant to be committed so it
+  survives across separate CI runs.
+- Re-running `julia train.jl <case>` automatically resumes from its
+  checkpoint (if one exists and isn't already marked done) instead of
+  starting over. Case 1 resumes at the exact stage (mini-batch / a specific
+  round's ADAM / that round's BFGS) it was interrupted at; Case 2 just
+  continues ADAM from the checkpointed parameters.
+- `.github/workflows/train.yml` sets `UDE_MAX_WALLTIME_SECONDS` to 5 hours
+  (leaving headroom under its own `timeout-minutes: 340`), trains Case 1,
+  only attempts Case 2 if Case 1's status is `"done"`, commits any
+  checkpoint changes back to the branch, uploads whatever's in `results/` as
+  an artifact, and — if either case isn't `"done"` yet — re-dispatches
+  itself (`gh workflow run train.yml`) so a fresh job continues training
+  from the just-committed checkpoint. This repeats automatically, run after
+  run, until both cases converge.
 
 ## Acceptance criterion
 
